@@ -18,6 +18,13 @@
 
 #define VEC_LEN 16
 
+#ifdef __has_include
+#if __has_include(<arm_neon_sve_bridge.h>)
+#include <arm_neon_sve_bridge.h>
+#define SONIC_USE_SVE_HIST 1
+#endif
+#endif
+
 #include <sonic/internal/arch/common/skip_common.h>
 #include <sonic/internal/utils.h>
 
@@ -34,16 +41,7 @@ using sonic_json::internal::common::SkipLiteral;
 
 #include "../common/arm_common/skip.inc.h"
 
-#ifdef __has_include
-#if __has_include(<arm_neon_sve_bridge.h>)
-#include <arm_neon_sve_bridge.h>
-#ifndef USE_SVE_HIST
-#define USE_SVE_HIST 1
-#endif
-#endif
-#endif
-
-#ifdef USE_SVE_HIST
+#ifdef SONIC_USE_SVE_HIST
 template <typename T>
 sonic_force_inline uint64_t GetStringBits(const T &v, uint64_t &prev_instring,
                                           uint64_t &prev_escaped,
@@ -51,7 +49,6 @@ sonic_force_inline uint64_t GetStringBits(const T &v, uint64_t &prev_instring,
                                           int quotes_count) {
   // const T v(data);
   uint64_t escaped = 0;
-  uint64_t bs_bits = 0;
   if (backslash_count) {
     uint64_t bs_bits = v.eq('\\');
     escaped = common::GetEscaped<64>(prev_escaped, bs_bits);
@@ -69,8 +66,7 @@ sonic_force_inline uint64_t GetStringBits(const T &v, uint64_t &prev_instring,
 }
 
 sonic_force_inline uint32_t count_chars(const uint8x16_t &data,
-                                        svuint8_t &tokens, uint8_t left,
-                                        uint8_t right) {
+                                        svuint8_t &tokens) {
   svuint8_t v = svundef_u8();
   v = svset_neonq_u8(v, data);
   svuint32_t vec32 = svreinterpret_u32(svhistseg_u8(tokens, v));
@@ -91,11 +87,11 @@ sonic_force_inline bool skip_container_sve(const uint8_t *data, size_t &pos,
     p = data + pos;
 
     T v(p);
-    uint32_t counts = count_chars(v.chunks[0], tokens, left, right);
-    // We know they don't overflow, max is 16*4, so we can directly accomulate
-    counts += count_chars(v.chunks[1], tokens, left, right);
-    counts += count_chars(v.chunks[2], tokens, left, right);
-    counts += count_chars(v.chunks[3], tokens, left, right);
+    uint32_t counts = count_chars(v.chunks[0], tokens);
+    // We know they don't overflow, max is 16*4, so we can directly accumulate.
+    counts += count_chars(v.chunks[1], tokens);
+    counts += count_chars(v.chunks[2], tokens);
+    counts += count_chars(v.chunks[3], tokens);
 
 #define SKIP_LOOP()                                                        \
   {                                                                        \
@@ -139,10 +135,15 @@ sonic_force_inline bool skip_container_sve(const uint8_t *data, size_t &pos,
       prev_instring ^= (0 - (int)(counts & 1));
       prev_escaped = 0;
     } else if (!(counts & 0xff) && prev_instring) {
-      // only backslahes and no quotes, the whole 64 bytes are inside a string
-      // so we dont care about left & right
-      // just check if the last character is a backslash
-      prev_escaped = (p[63] == '\\');
+      // With no quotes the whole block stays inside a string, so braces do not
+      // matter. Track the parity of trailing backslashes for the next block.
+      const uint8_t *tail = p + 64;
+      while (tail != p && tail[-1] == '\\') {
+        --tail;
+      }
+      if (tail != p) {
+        prev_escaped = ((p + 64 - tail) & 1);
+      }
     } else {
       SKIP_LOOP();
     }
@@ -152,11 +153,11 @@ sonic_force_inline bool skip_container_sve(const uint8_t *data, size_t &pos,
   std::memcpy(buf, data + pos, len - pos);
   p = buf;
   T v(p);
-  uint32_t counts = count_chars(v.chunks[0], tokens, left, right);
-  // We know they don't overflow, max is 16*4, so we can directly accomulate
-  counts += count_chars(v.chunks[1], tokens, left, right);
-  counts += count_chars(v.chunks[2], tokens, left, right);
-  counts += count_chars(v.chunks[3], tokens, left, right);
+  uint32_t counts = count_chars(v.chunks[0], tokens);
+  // We know they don't overflow, max is 16*4, so we can directly accumulate.
+  counts += count_chars(v.chunks[1], tokens);
+  counts += count_chars(v.chunks[2], tokens);
+  counts += count_chars(v.chunks[3], tokens);
   SKIP_LOOP();
 #undef SKIP_LOOP
   return false;
@@ -168,7 +169,7 @@ sonic_force_inline bool SkipContainer(const uint8_t *data, size_t &pos,
                                       size_t len, uint8_t left, uint8_t right) {
   // We use neon for the on demand parser since it is currently faster for
   // comparisons than sve
-#ifdef USE_SVE_HIST
+#ifdef SONIC_USE_SVE_HIST
   return skip_container_sve<sonic_json::internal::neon::simd8x64<uint8_t>>(
       data, pos, len, left, right);
 #else
@@ -204,4 +205,5 @@ sonic_force_inline uint8_t skip_space(const uint8_t *data, size_t &pos,
 }  // namespace internal
 }  // namespace sonic_json
 
+#undef SONIC_USE_SVE_HIST
 #undef VEC_LEN
